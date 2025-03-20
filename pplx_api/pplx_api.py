@@ -17,20 +17,22 @@ class Message(BaseModel):
     content: str
 
 class PerplexityRequest(BaseModel):
-    model: str = Field(default="llama-3.1-sonar-large-128k-online")
+    model: str = Field(default="sonar")
     messages: List[Message]
     max_tokens: Optional[int] = None
     temperature: float = Field(default=0.2, ge=0, lt=2)
     top_p: float = Field(default=0.9, ge=0, le=1)
-    return_citations: bool = Field(default=False)
+    return_citations: bool = Field(default=True)
     search_domain_filter: Optional[List[str]] = Field(default=None, max_length=3)
     return_images: bool = Field(default=False)
     return_related_questions: bool = Field(default=False)
-    search_recency_filter: Optional[str] = Field(default=None)
+    search_recency_filter: Optional[str] = Field(default=None, description="Filters search results based on time (e.g., 'week', 'day')")
     top_k: int = Field(default=0, ge=0, le=2048)
     stream: bool = Field(default=True)
     presence_penalty: float = Field(default=0, ge=-2, le=2)
     frequency_penalty: float = Field(default=1, ge=0)
+    response_format: Optional[Dict[str, Any]] = Field(default=None)
+    web_search_options: Optional[Dict[str, str]] = Field(default=None)
 
     @field_validator('search_recency_filter')
     def validate_search_recency_filter(cls, v):
@@ -39,6 +41,16 @@ class PerplexityRequest(BaseModel):
                 'invalid_search_recency_filter',
                 'search_recency_filter must be one of: month, week, day, hour'
             )
+        return v
+
+    @field_validator('web_search_options')
+    def validate_web_search_options(cls, v):
+        if v is not None and 'search_context_size' in v:
+            if v['search_context_size'] not in ['low', 'medium', 'high']:
+                raise PydanticCustomError(
+                    'invalid_search_context_size',
+                    'search_context_size must be one of: low, medium, high'
+                )
         return v
 
     model_config = {
@@ -87,7 +99,8 @@ class PerplexityClient:
                 "message": {"role": "assistant", "content": ""},
                 "delta": {"role": "assistant", "content": ""}
             }],
-            "usage": None
+            "usage": None,
+            "citations": []  # Move citations to root level
         }
 
         is_async_callback = stream_callback and asyncio.iscoroutinefunction(stream_callback)
@@ -106,24 +119,24 @@ class PerplexityClient:
 
             try:
                 chunk = json.loads(data)
-                # Update metadata
+                # Update metadata and citations
                 accumulated_response.update({
                     k: v for k, v in chunk.items() 
-                    if k in ["id", "model", "created"]
+                    if k in ["id", "model", "created", "citations"]
                 })
 
                 # Check for content delta
                 if "choices" in chunk and chunk["choices"]:
                     choice = chunk["choices"][0]
                     delta = choice.get("delta", {})
+                    
+                    # Handle content
                     if "content" in delta:
                         token = delta["content"]
-                        
-                        # Update accumulated content
                         accumulated_response["choices"][0]["delta"]["content"] += token
                         accumulated_response["choices"][0]["message"]["content"] += token
                         
-                        # Immediately stream token
+                        # Stream token
                         if stream_callback:
                             try:
                                 if is_async_callback:
@@ -175,16 +188,30 @@ class PerplexityClient:
     ) -> Dict[str, Any]:
         """Make either sync or async request to Perplexity API with retries."""
         try:
+            # Convert request to dict and handle None values
+            payload = request.model_dump(exclude_none=True)
+            
+            # Remove search_recency_filter if it's None
+            if "search_recency_filter" in payload and payload["search_recency_filter"] is None:
+                del payload["search_recency_filter"]
+
+            if self.debug:
+                logger.debug(f"Request payload: {json.dumps(payload, indent=2)}")
+
             if is_async:
                 # Async request using aiohttp
                 async with aiohttp.ClientSession() as session:
                     async with session.post(
                         self.BASE_URL,
-                        json=request.model_dump(exclude_none=True),
+                        json=payload,
                         headers=self._get_headers(),
                         timeout=aiohttp.ClientTimeout(total=60)
                     ) as response:
-                        response.raise_for_status()
+                        if not response.ok:
+                            error_body = await response.text()
+                            if self.debug:
+                                logger.error(f"Error response: {error_body}")
+                            raise aiohttp.ClientError(f"{response.status}, message='{response.reason}', body='{error_body}', url='{response.url}'")
                         if request.stream:
                             return await self._stream_response(response, stream_callback, is_async=True)
                         else:
@@ -193,12 +220,16 @@ class PerplexityClient:
                 # Sync request using requests
                 response = requests.post(
                     self.BASE_URL,
-                    json=request.model_dump(exclude_none=True),
+                    json=payload,
                     headers=self._get_headers(),
                     stream=request.stream,
                     timeout=60
                 )
-                response.raise_for_status()
+                if not response.ok:
+                    error_body = response.text
+                    if self.debug:
+                        logger.error(f"Error response: {error_body}")
+                    raise requests.RequestException(f"{response.status_code}, message='{response.reason}', body='{error_body}', url='{response.url}'")
                 
                 if request.stream:
                     return await self._stream_response(response, stream_callback, is_async=False)
@@ -238,3 +269,69 @@ class PerplexityClient:
             return await self._make_request(request, stream_callback, is_async=True)
         except Exception as e:
             raise aiohttp.ClientError(f"Error in Perplexity request: {str(e)}") from e
+
+if __name__ == "__main__":
+    import asyncio
+    import sys
+    from typing import Optional
+
+    async def stream_handler(token: str) -> None:
+        """Handle streaming tokens by printing them to stdout."""
+        print(token, end="", flush=True)
+
+    async def test_perplexity_api() -> None:
+        """Test the Perplexity API with a sample query."""
+        # Get API key from environment
+        api_key = os.environ.get("PERPLEXITY_API_KEY")
+        if not api_key:
+            print("Error: PERPLEXITY_API_KEY environment variable not set", file=sys.stderr)
+            sys.exit(1)
+
+        # Initialize client
+        client = PerplexityClient(api_key=api_key, debug=True)
+
+        # Create request matching example format exactly
+        request = PerplexityRequest(
+            model="sonar",
+            messages=[
+                Message(role="system", content="Be precise and concise."),
+                Message(role="user", content="Who is Kamiwaza.ai?")
+            ],
+            max_tokens=123,
+            temperature=0.2,
+            top_p=0.9,
+            search_domain_filter=["<any>"],
+            return_images=False,
+            return_related_questions=False,
+            top_k=0,
+            stream=False,  # Match their example exactly
+            presence_penalty=0,
+            frequency_penalty=1,
+            web_search_options={"search_context_size": "high"}
+        )
+
+        try:
+            print("\nTesting non-streaming response:")
+            print("-" * 80)
+            response = await client.async_chat_completion(request)
+            
+            # Print the content
+            print(response["choices"][0]["message"]["content"])
+            
+            # Print citations
+            print("\nCitations:")
+            print("-" * 80)
+            citations = response.get("citations", [])
+            for i, citation in enumerate(citations, 1):
+                print(f"{i}. {citation}")
+
+        except Exception as e:
+            print(f"Error testing Perplexity API: {e}", file=sys.stderr)
+            print("\nException details:")
+            print("-" * 80)
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
+
+    # Run the async test
+    asyncio.run(test_perplexity_api())
