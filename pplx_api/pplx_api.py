@@ -114,9 +114,6 @@ class PerplexityClient:
             if data == "[DONE]":
                 return
 
-            if self.debug:
-                logger.debug(f"PPLX chunk: {data}")
-
             try:
                 chunk = json.loads(data)
                 # Update metadata and citations
@@ -143,9 +140,8 @@ class PerplexityClient:
                                     await stream_callback(token)
                                 else:
                                     stream_callback(token)
-                            except Exception as e:
-                                if self.debug:
-                                    logger.error(f"Error in stream callback: {e}")
+                            except Exception:
+                                pass
 
                     # Handle completion
                     if "finish_reason" in choice:
@@ -155,9 +151,8 @@ class PerplexityClient:
                 if "usage" in chunk:
                     accumulated_response["usage"] = chunk["usage"]
 
-            except json.JSONDecodeError as e:
-                if self.debug:
-                    logger.error(f"Failed to parse JSON: {e}")
+            except json.JSONDecodeError:
+                pass
 
         if is_async:
             # Handle async response
@@ -195,9 +190,6 @@ class PerplexityClient:
             if "search_recency_filter" in payload and payload["search_recency_filter"] is None:
                 del payload["search_recency_filter"]
 
-            if self.debug:
-                logger.debug(f"Request payload: {json.dumps(payload, indent=2)}")
-
             if is_async:
                 # Async request using aiohttp
                 async with aiohttp.ClientSession() as session:
@@ -209,8 +201,6 @@ class PerplexityClient:
                     ) as response:
                         if not response.ok:
                             error_body = await response.text()
-                            if self.debug:
-                                logger.error(f"Error response: {error_body}")
                             raise aiohttp.ClientError(f"{response.status}, message='{response.reason}', body='{error_body}', url='{response.url}'")
                         if request.stream:
                             return await self._stream_response(response, stream_callback, is_async=True)
@@ -227,8 +217,6 @@ class PerplexityClient:
                 )
                 if not response.ok:
                     error_body = response.text
-                    if self.debug:
-                        logger.error(f"Error response: {error_body}")
                     raise requests.RequestException(f"{response.status_code}, message='{response.reason}', body='{error_body}', url='{response.url}'")
                 
                 if request.stream:
@@ -237,8 +225,6 @@ class PerplexityClient:
                     return response.json()
 
         except (requests.exceptions.RequestException, aiohttp.ClientError) as e:
-            if self.debug:
-                logger.warning(f"Request attempt {attempt + 1}/{self.MAX_RETRIES + 1} failed: {str(e)}")
             raise
 
     def chat_completion(
@@ -288,7 +274,7 @@ if __name__ == "__main__":
             sys.exit(1)
 
         # Initialize client
-        client = PerplexityClient(api_key=api_key, debug=True)
+        client = PerplexityClient(api_key=api_key)
 
         # Create request matching example format exactly
         request = PerplexityRequest(
@@ -297,9 +283,9 @@ if __name__ == "__main__":
                 Message(role="system", content="Be precise and concise."),
                 Message(role="user", content="Who is Kamiwaza.ai?")
             ],
-            max_tokens=123,
-            temperature=0.2,
-            top_p=0.9,
+            max_tokens=2048,
+            temperature=0.5,
+            top_p=0.95,
             search_domain_filter=["<any>"],
             return_images=False,
             return_related_questions=False,
@@ -314,12 +300,21 @@ if __name__ == "__main__":
             print("\nTesting non-streaming response:")
             print("-" * 80)
             response = await client.async_chat_completion(request)
-            
-            # Print the content
             print(response["choices"][0]["message"]["content"])
-            
-            # Print citations
             print("\nCitations:")
+            print("-" * 80)
+            citations = response.get("citations", [])
+            for i, citation in enumerate(citations, 1):
+                print(f"{i}. {citation}")
+
+            print("\n\nTesting streaming response:")
+            print("-" * 80)
+            request.stream = True
+            response = await client.async_chat_completion(
+                request,
+                stream_callback=stream_handler
+            )
+            print("\n\nCitations:")
             print("-" * 80)
             citations = response.get("citations", [])
             for i, citation in enumerate(citations, 1):
@@ -327,10 +322,6 @@ if __name__ == "__main__":
 
         except Exception as e:
             print(f"Error testing Perplexity API: {e}", file=sys.stderr)
-            print("\nException details:")
-            print("-" * 80)
-            import traceback
-            traceback.print_exc()
             sys.exit(1)
 
     # Run the async test
